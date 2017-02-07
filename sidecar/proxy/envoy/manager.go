@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -175,7 +174,7 @@ func (m *manager) generateConfig(rules []api.Rule, instances []api.ServiceInstan
 	routes := buildRoutes(rules)
 	filters := buildFaults(rules, inst.ServiceName, inst.Tags)
 
-	if err := buildFS(rules, m.workingDir); err != nil {
+	if err := buildFS(m.workingDir); err != nil {
 		return Config{}, err
 	}
 
@@ -405,7 +404,7 @@ func buildRoutes(ruleList []api.Rule) []Route {
 
 				runtime := &Runtime{
 					Key:     buildWeightKey(backend.Name, backend.Tags),
-					Default: 0,
+					Default: int(backend.Weight * 100),
 				}
 
 				route := Route{
@@ -485,6 +484,12 @@ func sanitizeRules(ruleList []api.Rule) {
 					}
 				}
 			}
+
+			sum = 0
+			for j := range rule.Route.Backends {
+				sum += rule.Route.Backends[j].Weight
+				rule.Route.Backends[j].Weight = sum
+			}
 		}
 	}
 
@@ -534,89 +539,13 @@ func randFilename(prefix string) string {
 	return fmt.Sprintf("%s%s", prefix, data)
 }
 
-func buildFS(ruleList []api.Rule, workingDir string) error {
-	type weightSpec struct {
-		Service string
-		Cluster string
-		Weight  int
-	}
-
-	var weights []weightSpec
-	for _, rule := range ruleList {
-		if rule.Route != nil {
-			w := 0
-			for _, backend := range rule.Route.Backends {
-				w += int(100 * backend.Weight)
-				weight := weightSpec{
-					Service: backend.Name,
-					Cluster: buildServiceKey("_", backend.Tags),
-					Weight:  w,
-				}
-				weights = append(weights, weight)
-			}
-		}
-	}
-
+func buildFS(workingDir string) error {
 	if err := os.MkdirAll(filepath.Dir(workingDir+runtimePath), configDirPerm); err != nil { // FIXME: hack
 		return err
 	}
 
 	if err := os.MkdirAll(workingDir+runtimeVersionsPath, configDirPerm); err != nil {
 		return err
-	}
-
-	dirName, err := ioutil.TempDir(workingDir+runtimeVersionsPath, "")
-	if err != nil {
-		return err
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			os.RemoveAll(dirName)
-		}
-	}()
-
-	for _, weight := range weights {
-		if err := os.MkdirAll(filepath.Join(dirName, "/traffic_shift/", weight.Service), configDirPerm); err != nil {
-			return err
-		} // FIXME: filemode?
-
-		filename := filepath.Join(dirName, "/traffic_shift/", weight.Service, weight.Cluster)
-		data := []byte(fmt.Sprintf("%v", weight.Weight))
-		if err := ioutil.WriteFile(filename, data, configFilePerm); err != nil {
-			return err
-		}
-	}
-
-	oldRuntime, err := os.Readlink(workingDir + runtimePath)
-	if err != nil && !os.IsNotExist(err) { // Ignore error from symlink not existing.
-		return err
-	}
-
-	tmpName := randFilename(workingDir + "/")
-
-	if err := os.Symlink(dirName, tmpName); err != nil {
-		return err
-	}
-
-	// Atomically replace the runtime symlink
-	if err := os.Rename(tmpName, workingDir+runtimePath); err != nil {
-		return err
-	}
-
-	success = true
-
-	// Clean up the old config FS if necessary
-	// TODO: make this safer
-	if oldRuntime != "" {
-		oldRuntimeDir := filepath.Dir(oldRuntime)
-		if filepath.Clean(oldRuntimeDir) == filepath.Clean(workingDir+runtimeVersionsPath) {
-			toDelete := filepath.Join(workingDir+runtimeVersionsPath, filepath.Base(oldRuntime))
-			if err := os.RemoveAll(toDelete); err != nil {
-				return err
-			}
-		}
 	}
 
 	return nil
